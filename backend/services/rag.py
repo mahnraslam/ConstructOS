@@ -4,102 +4,119 @@ from services import embedder, vector_store
 from services.gemini import generate, generate_with_images
 from models.schemas import QueryResponse, Citation
 
-logger = logging.getLogger(__name__)
-
+logger  = logging.getLogger(__name__)
 PAGES_DIR = os.getenv("PAGES_PATH", "storage/pages")
-
-# Maximum blueprint page images to attach per query.
-# Gemini Flash handles up to ~16 images per request, but we keep it low
-# to control latency and token cost. The top-3 pages by relevance are enough
-# to give the model a strong visual signal.
 MAX_VISUAL_PAGES = 3
 
-_SYSTEM = """You are ConstructOS — an expert construction document intelligence assistant.
-You specialise in engineering drawings, structural specifications, RFIs, and site reports.
-Your answers are used by engineers and site managers to make technical decisions.
+# ── Prompt templates ────────────────────────────────────────────────────────
 
-STRICT RULES:
-1. Answer ONLY from the provided document context. Never use general knowledge.
-2. If the answer is not in the context, respond exactly: "NOT FOUND IN DOCUMENTS"
-3. Always cite your source as: (Source N — filename, Page X)
-4. For technical values (dimensions, grades, rebar, loads), quote the exact number from the document.
-5. Be precise and concise. Engineers need facts, not padding."""
+_SINGLE_DOC_SYSTEM = """You are ConstructOS — a construction document assistant.
+Answer ONLY from the document context provided.
+If the answer is not in the context, say exactly: NOT FOUND IN DOCUMENTS
+Always quote the exact technical value (e.g. 200mm, C25/30, T16@150).
+Be concise. Engineers need facts."""
 
-_VISUAL_SYSTEM = """You are ConstructOS — an expert construction document intelligence assistant.
-You specialise in engineering drawings, structural specifications, RFIs, and site reports.
-Your answers are used by engineers and site managers to make technical decisions.
+_SINGLE_DOC_FORMAT = """Answer format:
+**[Direct answer in one sentence with the exact value]**
+Source: [filename, Page N]"""
 
-You are being provided with BOTH:
-  • Extracted text context from the relevant pages
-  • The actual page images so you can directly observe the drawings
+# ─────────────────────────────────────────────────────────────────────────────
+# Cross-document system — this is the one that gives answers like
+# "Slab thickness is 200mm per Blueprint Page 3, confirmed by Spec Section 4.2"
+# ─────────────────────────────────────────────────────────────────────────────
+_CROSS_DOC_SYSTEM = """You are ConstructOS — a construction document assistant.
+You are searching BOTH a blueprint (engineering drawing) AND a specification document.
 
-STRICT RULES:
-1. Use BOTH the text context AND what you can visually see in the images to form your answer.
-2. When the text is incomplete or absent, extract information directly from the drawing.
-3. If the answer is not in the context or visible in the images, respond: "NOT FOUND IN DOCUMENTS"
-4. Always cite your source as: (Source N — filename, Page X)
-5. For technical values (dimensions, grades, rebar), quote the exact number you see.
-6. Be precise and concise. Engineers need facts, not padding.
-7. If you can see something in the drawing that the text missed, explicitly note it as
-   "(visually observed in drawing)" so the engineer knows the source."""
+Your job:
+1. Find the answer in either or both documents
+2. Cross-reference them — does the blueprint match the spec?
+3. Always state WHICH document (blueprint or spec) gave each value
+4. If they agree: confirm both
+5. If they disagree: clearly flag the discrepancy with exact values from each
 
-_ANSWER_FORMAT = """
-Structure your answer as:
-**Answer:** [1-2 sentence direct answer]
-**Technical Detail:** [exact values, materials, codes — if available]
-**Source:** [filename, Page N — verbatim quote from the document, max 100 chars]
-"""
+RULES:
+- Only use information from the context provided — never general knowledge
+- Always give the exact technical value (200mm, not "about 200")
+- If only one doc has the answer, say so and cite that doc
+- If neither has it, say: NOT FOUND IN DOCUMENTS"""
 
-_VISUAL_ANSWER_FORMAT = """
-Structure your answer as:
-**Answer:** [1-2 sentence direct answer]
-**Technical Detail:** [exact values, materials, codes — include whether from text or drawing]
-**Visual Observations:** [anything significant you can see in the drawing images that supplements the text]
-**Source:** [filename, Page N]
-"""
+_CROSS_DOC_FORMAT = """Answer format (use exactly this structure):
+
+**[One sentence direct answer with the exact value]**
+
+📐 Blueprint says: [exact value from drawing + "Page N" or "not mentioned"]
+📋 Specification says: [exact value from spec + "Page N" or "not mentioned"]
+✅ Status: [Consistent / ⚠ Discrepancy — blueprint shows X but spec requires Y]"""
 
 
-def _build_context(chunks: list[dict]) -> str:
-    """Format retrieved chunks as a numbered source block."""
-    lines = []
+# ── Helpers ─────────────────────────────────────────────────────────────────
+
+def _is_blueprint(chunk: dict) -> bool:
+    return chunk.get("doc_type", "other") == "blueprint"
+
+def _is_spec(chunk: dict) -> bool:
+    return chunk.get("doc_type", "other") in ("specification", "submittal", "om_manual")
+
+
+def _build_cross_context(chunks: list[dict]) -> str:
+    """
+    Build a context block that clearly separates blueprint chunks from spec
+    chunks so Gemini knows which document type said what.
+    """
+    bp_chunks   = [c for c in chunks if _is_blueprint(c)]
+    spec_chunks = [c for c in chunks if _is_spec(c)]
+    other       = [c for c in chunks if not _is_blueprint(c) and not _is_spec(c)]
+
+    parts = []
+
+    if bp_chunks:
+        parts.append("── BLUEPRINT (Engineering Drawing) ──")
+        for i, c in enumerate(bp_chunks, 1):
+            parts.append(f"[Blueprint Source {i}: {c['filename']}, Page {c['page']}]\n{c['text']}")
+
+    if spec_chunks:
+        parts.append("── SPECIFICATION (Written Spec) ──")
+        for i, c in enumerate(spec_chunks, 1):
+            parts.append(f"[Spec Source {i}: {c['filename']}, Page {c['page']}]\n{c['text']}")
+
+    if other:
+        parts.append("── OTHER DOCUMENTS ──")
+        for i, c in enumerate(other, 1):
+            parts.append(f"[Source {i}: {c['filename']}, Page {c['page']}]\n{c['text']}")
+
+    return "\n\n".join(parts)
+
+
+def _build_single_context(chunks: list[dict]) -> str:
+    parts = []
     for i, c in enumerate(chunks, 1):
-        lines.append(f"[Source {i}: {c['filename']}, Page {c['page']}]\n{c['text']}")
-    return "\n\n---\n\n".join(lines)
+        parts.append(f"[Source {i}: {c['filename']}, Page {c['page']}]\n{c['text']}")
+    return "\n\n---\n\n".join(parts)
 
 
-def _image_paths_for_chunks(chunks: list[dict], max_images: int = MAX_VISUAL_PAGES) -> list[str]:
-    """
-    Return filesystem paths for the page PNGs corresponding to the top chunks.
-    De-duplicates by (doc_id, page) and caps at max_images to keep requests lean.
-    Only paths that actually exist on disk are returned.
-    """
-    seen: set[tuple] = set()
-    paths: list[str] = []
-    for c in chunks:
+def _image_paths(chunks: list[dict]) -> list[str]:
+    seen, paths = set(), []
+    # Prioritise blueprint pages for images (drawings benefit most from vision)
+    ordered = sorted(chunks, key=lambda c: (0 if _is_blueprint(c) else 1, -c["relevance_score"]))
+    for c in ordered:
         key = (c["doc_id"], c["page"])
         if key in seen:
             continue
         seen.add(key)
-        path = os.path.join(PAGES_DIR, f"{c['doc_id']}_page_{c['page']}.png")
-        if os.path.exists(path):
-            paths.append(path)
-        else:
-            logger.debug(f"[rag] Page image not on disk: {path}")
-        if len(paths) >= max_images:
+        p = os.path.join(PAGES_DIR, f"{c['doc_id']}_page_{c['page']}.png")
+        if os.path.exists(p):
+            paths.append(p)
+        if len(paths) >= MAX_VISUAL_PAGES:
             break
     return paths
 
 
-def _citation_image_url(c: dict) -> str | None:
-    """
-    Return the static URL for a chunk's page image if it exists on disk.
-    The FastAPI app mounts storage/pages at /pages, so the URL is stable.
-    """
-    path = os.path.join(PAGES_DIR, f"{c['doc_id']}_page_{c['page']}.png")
-    if os.path.exists(path):
-        return f"/pages/{c['doc_id']}_page_{c['page']}.png"
-    return None
+def _image_url(c: dict) -> str | None:
+    p = os.path.join(PAGES_DIR, f"{c['doc_id']}_page_{c['page']}.png")
+    return f"/pages/{c['doc_id']}_page_{c['page']}.png" if os.path.exists(p) else None
 
+
+# ── Public API ───────────────────────────────────────────────────────────────
 
 def answer(
     question: str,
@@ -108,65 +125,64 @@ def answer(
     visual: bool = False,
 ) -> QueryResponse:
     """
-    Answer a construction document question.
+    Answer a question by searching across uploaded documents.
 
-    visual=False (default): text-only RAG — identical to previous behaviour.
-    visual=True:            multimodal RAG — top page images are sent to
-                            Gemini Vision alongside the extracted text so the
-                            model can *see* the drawings when answering.
+    When doc_ids contains both a blueprint and a spec, the prompt switches to
+    cross-document mode: Gemini is told which chunks are from the drawing and
+    which are from the written spec, and is asked to cross-reference them.
+    The answer then reads like:
+        "Slab thickness is 200mm.
+         📐 Blueprint says: 200mm, Page 3
+         📋 Specification says: 200mm per Clause 4.3, Page 8
+         ✅ Status: Consistent"
 
-    Either way, every Citation now carries an image_url pointing to the
-    pre-rendered PNG for that page, so the frontend can show inline previews.
+    visual=True → blueprint page images are passed to Gemini so it can read
+    dimensions annotated on the drawing directly, not just extracted text.
     """
-    # 1. Embed question and retrieve relevant chunks
     q_emb  = embedder.embed_query(question)
     chunks = vector_store.query(q_emb, doc_ids, n=top_k)
 
     if not chunks:
         return QueryResponse(
-            question  = question,
-            answer    = "NOT FOUND IN DOCUMENTS — no documents have been uploaded yet.",
-            citations = [],
+            question=question,
+            answer="NOT FOUND IN DOCUMENTS — no documents uploaded yet.",
+            citations=[],
         )
 
-    # 2. Build text context
-    context = _build_context(chunks)
+    # Decide which prompt mode to use
+    has_blueprint = any(_is_blueprint(c) for c in chunks)
+    has_spec      = any(_is_spec(c) for c in chunks)
+    cross_mode    = has_blueprint and has_spec
 
-    if visual:
-        # 3a. Visual path: load page images for top chunks
-        image_paths = _image_paths_for_chunks(chunks)
-        n_images = len(image_paths)
-        logger.info(f"[rag] Visual mode: attaching {n_images} page image(s) for query")
-
-        prompt = f"""{_VISUAL_SYSTEM}
-
-EXTRACTED TEXT CONTEXT:
-{context}
-
-QUESTION: {question}
-
-{_VISUAL_ANSWER_FORMAT}
-
-Note: {n_images} blueprint page image(s) are also attached — use them to supplement
-the text context above. If you can read dimensions, annotations, or details directly
-from the drawing that are not in the text, include them in your answer.
-"""
-        answer_text = generate_with_images(prompt, image_paths)
-
+    if cross_mode:
+        context = _build_cross_context(chunks)
+        system  = _CROSS_DOC_SYSTEM
+        fmt     = _CROSS_DOC_FORMAT
+        logger.info(f"[rag] Cross-document mode: blueprint + spec chunks both present")
     else:
-        # 3b. Text-only path (original behaviour)
-        prompt = f"""{_SYSTEM}
+        context = _build_single_context(chunks)
+        system  = _SINGLE_DOC_SYSTEM
+        fmt     = _SINGLE_DOC_FORMAT
+        logger.info(f"[rag] Single-document mode")
+
+    prompt = f"""{system}
 
 DOCUMENT CONTEXT:
 {context}
 
 QUESTION: {question}
 
-{_ANSWER_FORMAT}
-"""
+{fmt}"""
+
+    if visual:
+        img_paths = _image_paths(chunks)
+        logger.info(f"[rag] Visual mode: {len(img_paths)} page image(s) attached")
+        if img_paths:
+            prompt += f"\n\n{len(img_paths)} blueprint page image(s) attached — read any dimensions or annotations you can see directly from the drawing."
+        answer_text = generate_with_images(prompt, img_paths) if img_paths else generate(prompt)
+    else:
         answer_text = generate(prompt)
 
-    # 4. Build citations — always include image_url now so the UI can render previews
     citations = [
         Citation(
             doc_id          = c["doc_id"],
@@ -174,7 +190,8 @@ QUESTION: {question}
             page_num        = c["page"],
             chunk_text      = c["text"][:300],
             relevance_score = c["relevance_score"],
-            image_url       = _citation_image_url(c),
+            image_url       = _image_url(c),
+            doc_type        = c.get("doc_type", "other"),
         )
         for c in chunks
     ]

@@ -1,4 +1,3 @@
- 
 import axios from 'axios'
 const BASE = import.meta.env.VITE_API_URL || ''
 const api  = axios.create({ baseURL: BASE })
@@ -25,4 +24,11 @@ export const queryDocuments  = (question, doc_ids = null, top_k = 5, visual = fa
 
 export const detectConflicts = (doc_id_a, doc_id_b, filename_a = '', filename_b = '') =>
   api.post('/api/conflicts/detect', { doc_id_a, doc_id_b, filename_a, filename_b })
- 
+
+/**
+ * Generate RFIs by comparing a blueprint against a specification.
+ * visual=true (default) → blueprint page images sent to Gemini so it reads
+ * the drawing directly, not just extracted text.
+ */
+export const generateRFIs = (blueprint_doc_id, spec_doc_id, blueprint_filename = '', spec_filename = '', visual = true) =>
+  api.post('/api/rfi/generate', { blueprint_doc_id, spec_doc_id, blueprint_filename, spec_filename, visual })
