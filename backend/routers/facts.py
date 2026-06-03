@@ -37,3 +37,4 @@ def extract_facts(body: ExtractRequest, db: Session = Depends(get_db)):
 def list_project_facts(project_id: str, db: Session = Depends(get_db)):
     """List all extracted facts for a project."""
     return get_facts_for_project(project_id, db)
+ 

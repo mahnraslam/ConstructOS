@@ -51,9 +51,9 @@ def detect_fact_conflicts(project_id: str, db: Session) -> FactConflictResponse:
     spec_by_field: dict[str, list[Fact]] = {}
 
     for f in bp_facts:
-        bp_by_field.setdefault(f.field, []).append(f)
+        bp_by_field.setdefault(_normalise_field(f.field), []).append(f)
     for f in spec_facts:
-        spec_by_field.setdefault(f.field, []).append(f)
+        spec_by_field.setdefault(_normalise_field(f.field), []).append(f)
 
     conflicts: list[FactConflict] = []
     checked_fields = set(bp_by_field.keys()) & set(spec_by_field.keys())
@@ -216,19 +216,25 @@ def detect(doc_id_a: str, doc_id_b: str, filename_a: str, filename_b: str) -> Co
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
+def _normalise_field(field: str) -> str:
+    """Normalise LLM-returned field names to underscore_lower for consistent matching."""
+    return field.strip().lower().replace(" ", "_").replace("-", "_")
+
+
 def _normalise_value(raw: str) -> str:
     """
     Normalise a fact value for comparison.
-    - Lowercase
-    - Remove surrounding whitespace
-    - Standardise common unit abbreviations
-    - Extract numeric part for numeric comparison
+    - Lowercase + strip
+    - Standardise unit spacing: "200mm" → "200 mm"
+    - Keep only the leading numeric+unit token so extra words don't block matching
     """
     v = raw.strip().lower()
-    # Normalise unit spacing: "200mm" → "200 mm"
-    v = re.sub(r"(\d)\s*(mm|cm|m|mpa|kn|kpa|kg)\b", r"\1 \2", v)
-    # Remove trailing periods
+    v = re.sub(r"(\d)\s*(mm|cm|m|mpa|n/mm2|kn|kpa|kg|mpa)\b", r"\1 \2", v)
     v = v.rstrip(".")
+    # If value starts with a number+unit, use just that token for comparison
+    m = re.match(r"(\d+(?:\.\d+)?\s*(?:mm|cm|m|mpa|n/mm2|kn|kpa|kg)?)", v)
+    if m:
+        return m.group(1).strip()
     return v
 
 

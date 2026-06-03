@@ -74,13 +74,13 @@ def extract_facts_for_document(
 
     total = 0
     for category, fields in FACT_CATEGORIES.items():
-        # Query chunks relevant to each category using representative keywords
         category_query = " ".join(fields)
         q_emb  = embedder.embed_query(category_query)
-        chunks = vector_store.query(q_emb, [doc_id], n=5)
+        # Increased n to 15 to capture more of the document
+        chunks = vector_store.query(q_emb, [doc_id], n=15)
 
         for chunk in chunks:
-            if chunk["relevance_score"] < 0.25:
+            if chunk["relevance_score"] < 0.15:   # lowered threshold
                 continue
             facts = _extract_from_chunk(chunk, filename, doc_type, fields)
             for f in facts:
