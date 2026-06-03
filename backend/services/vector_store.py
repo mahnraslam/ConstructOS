@@ -51,6 +51,7 @@ def query(
             "doc_id":           meta["doc_id"],
             "filename":         meta["filename"],
             "page":             meta["page"],
+            "doc_type":         meta.get("doc_type", "other"),
             "relevance_score":  score,
         })
     return items

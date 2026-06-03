@@ -2,33 +2,54 @@ import axios from 'axios'
 const BASE = import.meta.env.VITE_API_URL || ''
 const api  = axios.create({ baseURL: BASE })
 
-export const uploadDocument  = (file, docType = '') => {
+// ── Documents ─────────────────────────────────────────────────────────────
+export const uploadDocument = (file, docType = '', projectId = '') => {
   const f = new FormData()
   f.append('file', file)
-  if (docType) f.append('doc_type', docType)
+  if (docType)   f.append('doc_type', docType)
+  if (projectId) f.append('project_id', projectId)
   return api.post('/api/documents/upload', f)
 }
-export const listDocuments   = ()     => api.get('/api/documents/')
-export const deleteDocument  = (id)   => api.delete(`/api/documents/${id}`)
-export const getPageUrl      = (docId, page) => `${BASE}/pages/${docId}_page_${page}.png`
+export const listDocuments  = ()    => api.get('/api/documents/')
+export const deleteDocument = (id)  => api.delete(`/api/documents/${id}`)
+export const getPageUrl     = (docId, page) => `${BASE}/pages/${docId}_page_${page}.png`
 
-/**
- * Query documents with optional visual mode.
- *
- * visual=true → backend passes retrieved page PNGs to Gemini Vision so it can
- * actually *see* the drawing alongside the extracted text.  Citations in the
- * response will include an image_url for inline preview.
- */
-export const queryDocuments  = (question, doc_ids = null, top_k = 5, visual = false) =>
-  api.post('/api/query/', { question, doc_ids, top_k, visual })
+// ── Query ─────────────────────────────────────────────────────────────────
+export const queryDocuments = (question, doc_ids = null, top_k = 5, visual = false, project_id = null) =>
+  api.post('/api/query/', { question, doc_ids, top_k, visual, project_id })
 
+// ── Conflicts ─────────────────────────────────────────────────────────────
 export const detectConflicts = (doc_id_a, doc_id_b, filename_a = '', filename_b = '') =>
   api.post('/api/conflicts/detect', { doc_id_a, doc_id_b, filename_a, filename_b })
 
-/**
- * Generate RFIs by comparing a blueprint against a specification.
- * visual=true (default) → blueprint page images sent to Gemini so it reads
- * the drawing directly, not just extracted text.
- */
-export const generateRFIs = (blueprint_doc_id, spec_doc_id, blueprint_filename = '', spec_filename = '', visual = true) =>
-  api.post('/api/rfi/generate', { blueprint_doc_id, spec_doc_id, blueprint_filename, spec_filename, visual })
+export const detectProjectConflicts = (projectId) =>
+  api.post(`/api/conflicts/project/${projectId}/detect`)
+
+export const getProjectConflicts = (projectId) =>
+  api.get(`/api/conflicts/project/${projectId}`)
+
+// ── RFIs ──────────────────────────────────────────────────────────────────
+export const generateProjectRFIs = (projectId) =>
+  api.post('/api/rfi/project/generate', { project_id: projectId })
+
+export const getProjectRFIs = (projectId) =>
+  api.get(`/api/rfi/project/${projectId}`)
+
+// ── Projects ─────────────────────────────────────────────────────────────
+export const listProjects     = ()                             => api.get('/api/projects/')
+export const getProject       = (id)                          => api.get(`/api/projects/${id}`)
+export const createProject    = (name, description = '')      => api.post('/api/projects/', { name, description })
+export const deleteProject    = (id)                          => api.delete(`/api/projects/${id}`)
+
+export const addDocToProject  = (projectId, doc) =>
+  api.post(`/api/projects/${projectId}/documents`, doc)
+export const listProjectDocs  = (projectId) =>
+  api.get(`/api/projects/${projectId}/documents`)
+export const removeDocFromProject = (projectId, docId) =>
+  api.delete(`/api/projects/${projectId}/documents/${docId}`)
+
+// ── Facts ─────────────────────────────────────────────────────────────────
+export const extractFacts     = (projectId, docId) =>
+  api.post('/api/facts/extract', { project_id: projectId, doc_id: docId })
+export const getProjectFacts  = (projectId) =>
+  api.get(`/api/facts/project/${projectId}`)

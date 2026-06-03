@@ -48,10 +48,11 @@ const SUGGESTIONS = [
   'Are there any fire rating requirements?',
 ]
 
-export default function ChatPanel({ docIds, onJumpToPage }) {
+export default function ChatPanel({ docIds, projectId, onJumpToPage }) {
   const [messages, setMessages] = useState([])
   const [input,    setInput]    = useState('')
   const [loading,  setLoading]  = useState(false)
+  const [error,    setError]    = useState('')
   const bottomRef = useRef()
 
   useEffect(() => { bottomRef.current?.scrollIntoView({ behavior: 'smooth' }) }, [messages, loading])
@@ -63,10 +64,19 @@ export default function ChatPanel({ docIds, onJumpToPage }) {
     setMessages(m => [...m, { role: 'user', text: q }])
     setLoading(true)
     try {
-      const res = await queryDocuments(q, docIds?.length ? docIds : null)
-      setMessages(m => [...m, { role: 'ai', text: res.data.answer, citations: res.data.citations }])
+      if (!docIds || docIds.length === 0) {
+        throw new Error('Please select at least one document from the sidebar.')
+      }
+      setError('')
+      const res = await queryDocuments(q, docIds, 5, false, projectId || null)
+      const { answer, citations, references } = res.data
+      // Prefer structured references; fall back to citations
+      const sources = references?.length ? references.map(r => ({ ref: r })) : citations.map(c => ({ cit: c }))
+      setMessages(m => [...m, { role: 'ai', text: answer, sources }])
     } catch (e) {
-      setMessages(m => [...m, { role: 'ai', text: '⚠ Error: ' + (e.response?.data?.detail || e.message), citations: [] }])
+      const errMsg = e.response?.data?.detail || e.message
+      setError(errMsg)
+      setMessages(m => [...m, { role: 'ai', text: '⚠ ' + errMsg, sources: [] }])
     } finally { setLoading(false) }
   }
 
@@ -74,28 +84,46 @@ export default function ChatPanel({ docIds, onJumpToPage }) {
     <div style={S.wrap}>
       <style>{`@keyframes bounce { 0%,100%{transform:translateY(0)} 50%{transform:translateY(-5px)} }`}</style>
 
+      {/* Header showing selected documents */}
+      {docIds && docIds.length > 0 && (
+        <div style={{ padding: '8px 16px', background: '#0f1b2d', borderBottom: '1px solid #1e3a5f',
+                      fontSize: 11, color: '#6b7a99', fontWeight: 600 }}>
+          📚 Searching {docIds.length} document{docIds.length !== 1 ? 's' : ''} · Edit selection in sidebar
+        </div>
+      )}
+
       <div style={S.msgs}>
         {messages.length === 0 ? (
           <div style={S.empty}>
             <div style={S.emIcon}>🏗</div>
             <div style={S.emTitle}>Ask about your blueprints</div>
-            <div style={S.emSub}>Ask any technical question about uploaded documents. Answers come with page citations.</div>
-            <div style={S.suggestions}>
-              {SUGGESTIONS.map(s => (
-                <div key={s} style={S.sug} onClick={() => send(s)}>{s}</div>
-              ))}
+            <div style={S.emSub}>
+              {docIds && docIds.length > 0 
+                ? `Searching ${docIds.length} document${docIds.length !== 1 ? 's' : ''} selected in sidebar.`
+                : 'No documents selected. Choose documents from the sidebar.'}
+              <br />Ask any technical question about uploaded documents. Answers come with page citations.
             </div>
+            {docIds && docIds.length > 0 && (
+              <div style={S.suggestions}>
+                {SUGGESTIONS.map(s => (
+                  <div key={s} style={S.sug} onClick={() => send(s)}>{s}</div>
+                ))}
+              </div>
+            )}
           </div>
         ) : (
           messages.map((m, i) => (
             <div key={i} style={S.bubble(m.role)}>
               <div style={S.role(m.role)}>{m.role === 'user' ? '👤 You' : '⚙ ConstructOS'}</div>
               <div style={S.text}>{m.text}</div>
-              {m.citations?.length > 0 && (
+              {m.sources?.length > 0 && (
                 <div style={S.cits}>
-                  <div style={S.citHdr}>📎 Sources ({m.citations.length})</div>
-                  {m.citations.map((c, j) => (
-                    <CitationCard key={j} citation={c} onJumpToPage={onJumpToPage} />
+                  <div style={S.citHdr}>📎 Evidence ({m.sources.length})</div>
+                  {m.sources.map((s, j) => (
+                    <CitationCard key={j}
+                      citation={s.cit}
+                      reference={s.ref}
+                      onJumpToPage={onJumpToPage} />
                   ))}
                 </div>
               )}
@@ -114,11 +142,12 @@ export default function ChatPanel({ docIds, onJumpToPage }) {
         <input
           style={S.input}
           value={input}
-          onChange={e => setInput(e.target.value)}
+          onChange={e => { setInput(e.target.value); setError('') }}
           onKeyDown={e => e.key === 'Enter' && !e.shiftKey && send()}
           placeholder="Ask a technical question about the blueprints…"
+          disabled={!docIds || docIds.length === 0}
         />
-        <button style={S.send} onClick={() => send()} disabled={loading}>
+        <button style={S.send} onClick={() => send()} disabled={loading || !docIds || docIds.length === 0}>
           {loading ? '…' : 'Ask'}
         </button>
       </div>

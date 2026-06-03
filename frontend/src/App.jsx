@@ -1,12 +1,15 @@
 import { Routes, Route } from "react-router-dom";
-import Dashboard from "./pages/Dashboard";
+import ProjectWorkspace from "./pages/ProjectWorkspace";
 import ProjectView from "./pages/ProjectView";
+import ErrorBoundary from "./components/ErrorBoundary";
 
 export default function App() {
   return (
-    <Routes>
-      <Route path="/" element={<Dashboard />} />
-      <Route path="/project/:docId" element={<ProjectView />} />
-    </Routes>
+    <ErrorBoundary>
+      <Routes>
+        <Route path="/" element={<ProjectWorkspace />} />
+        <Route path="/project/:projectId" element={<ProjectView />} />
+      </Routes>
+    </ErrorBoundary>
   );
 }

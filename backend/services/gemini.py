@@ -2,7 +2,7 @@ import os
 import re
 import logging
 import base64
-import google.generativeai as genai
+from google import genai
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -13,21 +13,24 @@ _API_KEY = os.getenv("GEMINI_API_KEY", "")
 if not _API_KEY or _API_KEY in ("your_key_here", "your_gemini_api_key_here", "test-key"):
     logger.warning("[gemini] GEMINI_API_KEY is not set or is a placeholder. LLM calls will fail.")
 
-genai.configure(api_key=_API_KEY)
+# Initialize new google-genai SDK
+_client = genai.Client(api_key=_API_KEY)
 
 _GEN_MODEL   = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
-_EMBED_MODEL = os.getenv("GEMINI_EMBED_MODEL", "models/text-embedding-004")
-_model = genai.GenerativeModel(_GEN_MODEL)
+_EMBED_MODEL = "text-embedding-004"
 
 MAX_RETRIES = 2
 
 
 def embed_text(text: str) -> list[float]:
-    """Embed a single string → 768-dim Gemini vector."""
+    """Embed a single string using text-embedding-004 → 768-dim vector."""
     if len(text) > 8000:
         logger.warning(f"[gemini] Text truncated from {len(text)} to 8000 chars for embedding")
-    result = genai.embed_content(model=_EMBED_MODEL, content=text[:8000])
-    return result["embedding"]
+    result = _client.models.embed_content(
+        model=_EMBED_MODEL,
+        contents=text[:8000],
+    )
+    return result.embedding
 
 
 def embed_batch(texts: list[str]) -> list[list[float]]:
@@ -52,9 +55,12 @@ def embed_batch(texts: list[str]) -> list[list[float]]:
 
 
 def generate(prompt: str) -> str:
-    """Plain text generation."""
+    """Plain text generation using gemini-2.0-flash."""
     try:
-        response = _model.generate_content(prompt)
+        response = _client.models.generate_content(
+            model=_GEN_MODEL,
+            contents=prompt,
+        )
         return response.text
     except Exception as e:
         logger.error(f"[gemini] Generation failed: {e}")
@@ -64,7 +70,6 @@ def generate(prompt: str) -> str:
 def generate_json(prompt: str) -> str:
     """Generation expected to return JSON — caller parses."""
     raw = generate(prompt)
-    # Strip markdown code fences if Gemini wraps the response
     cleaned = re.sub(r'^```(?:json)?\s*\n?', '', raw.strip())
     cleaned = re.sub(r'\n?```\s*$', '', cleaned)
     return cleaned.strip()
@@ -73,18 +78,9 @@ def generate_json(prompt: str) -> str:
 def generate_with_images(prompt: str, image_paths: list[str]) -> str:
     """
     Multimodal generation: send text prompt together with one or more page
-    images so Gemini can *see* the drawings when formulating its answer.
-
-    Called at query time (not just ingestion time) so the model can reason
-    about dimensions, annotations, and graphical content that text extraction
-    alone misses.
-
-    image_paths: absolute filesystem paths to pre-rendered PNG pages.
-    Non-existent paths are silently skipped so a missing render never blocks
-    an answer.
+    images so Gemini can see the drawings when formulating its answer.
     """
     content: list = []
-
     loaded = 0
     for path in image_paths:
         if not os.path.exists(path):
@@ -106,11 +102,13 @@ def generate_with_images(prompt: str, image_paths: list[str]) -> str:
 
     try:
         logger.info(f"[gemini] Multimodal generation with {loaded} page image(s)")
-        response = _model.generate_content(content)
+        response = _client.models.generate_content(
+            model=_GEN_MODEL,
+            contents=content,
+        )
         return response.text
     except Exception as e:
         logger.error(f"[gemini] Multimodal generation failed: {e}")
-        # Degrade gracefully to text-only rather than surfacing a raw error
         logger.info("[gemini] Falling back to text-only generation")
         return generate(prompt)
 
@@ -138,7 +136,10 @@ def describe_blueprint_page(image_path: str) -> str:
             "Be precise and technical. Format as a numbered structured list. "
             "If a section has nothing visible, skip it."
         )
-        response = _model.generate_content([img_part, prompt])
+        response = _client.models.generate_content(
+            model=_GEN_MODEL,
+            contents=[img_part, prompt],
+        )
         return response.text
     except Exception as e:
         logger.error(f"[gemini] Vision failed for {image_path}: {e}")

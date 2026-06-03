@@ -1,46 +1,36 @@
-from fastapi import APIRouter, HTTPException
-from models.schemas import RFIRequest, RFIResponse
-from services.rfi import generate_rfis
-from services import vector_store
+from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy.orm import Session
+from pydantic import BaseModel
+from typing import List
+from db import get_db
+from services.rfi import generate_project_rfis, get_stored_rfis
+from models.schemas import RFIItem
 
 router = APIRouter()
 
 
-@router.post("/generate", response_model=RFIResponse)
-async def generate_rfi(req: RFIRequest):
+class GenerateRequest(BaseModel):
+    project_id: str
+
+
+class RFIListResponse(BaseModel):
+    project_id: str
+    rfis: List[RFIItem]
+    total: int
+
+
+@router.post("/project/generate", response_model=RFIListResponse)
+def generate_rfis(body: GenerateRequest, db: Session = Depends(get_db)):
     """
-    Compare a blueprint document against a specification and generate RFIs
-    for every discrepancy found.
-
-    How it works:
-    1. 12 construction topics are probed (slab, rebar, columns, etc.)
-    2. For each topic, the most relevant chunks from each document are retrieved.
-    3. With visual=true (default), the blueprint page images are sent to Gemini
-       Vision so it can read dimensions and annotations directly off the drawing —
-       not just rely on extracted text.
-    4. Gemini returns structured discrepancy data per topic.
-    5. Each discrepancy becomes a numbered RFI with priority, references,
-       exact quotes, a clarification question, and a suggested resolution.
-
-    Returns RFIResponse with a list of RFIItem objects ready to display or export.
+    Generate RFIs from previously-detected fact conflicts for a project.
+    Run /conflicts/project/{id}/detect first to populate conflicts.
     """
-    # Resolve filenames from the vector store if not provided
-    blueprint_filename = req.blueprint_filename
-    spec_filename      = req.spec_filename
+    rfis = generate_project_rfis(body.project_id, db)
+    return RFIListResponse(project_id=body.project_id, rfis=rfis, total=len(rfis))
 
-    if not blueprint_filename or not spec_filename:
-        docs = {d.doc_id: d.filename for d in vector_store.list_documents()}
-        blueprint_filename = blueprint_filename or docs.get(req.blueprint_doc_id, req.blueprint_doc_id)
-        spec_filename      = spec_filename      or docs.get(req.spec_doc_id,       req.spec_doc_id)
 
-    try:
-        return generate_rfis(
-            blueprint_doc_id   = req.blueprint_doc_id,
-            spec_doc_id        = req.spec_doc_id,
-            blueprint_filename = blueprint_filename,
-            spec_filename      = spec_filename,
-            visual             = req.visual,
-            top_k_per_topic    = req.top_k_per_topic,
-        )
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"RFI generation failed: {e}")
+@router.get("/project/{project_id}", response_model=RFIListResponse)
+def get_rfis(project_id: str, db: Session = Depends(get_db)):
+    """Return stored RFIs for a project."""
+    rfis = get_stored_rfis(project_id, db)
+    return RFIListResponse(project_id=project_id, rfis=rfis, total=len(rfis))
