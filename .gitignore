@@ -11,7 +11,7 @@ venv/
 .env.local
 
 # Node
-/frontend/node_modules/
+frontend/node_modules/
 dist/
 
 # Storage (runtime data)
