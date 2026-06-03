@@ -4,7 +4,7 @@ import logging
 import base64
 from google import genai
 from dotenv import load_dotenv
-
+ 
 load_dotenv()
 
 logger = logging.getLogger(__name__)
@@ -17,11 +17,9 @@ if not _API_KEY or _API_KEY in ("your_key_here", "your_gemini_api_key_here", "te
 _client = genai.Client(api_key=_API_KEY)
 
 _GEN_MODEL   = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
-_EMBED_MODEL = "text-embedding-004"
-
+_EMBED_MODEL = "gemini-embedding-001"
+ 
 MAX_RETRIES = 2
-
-
 def embed_text(text: str) -> list[float]:
     """Embed a single string using text-embedding-004 → 768-dim vector."""
     if len(text) > 8000:
@@ -30,7 +28,7 @@ def embed_text(text: str) -> list[float]:
         model=_EMBED_MODEL,
         contents=text[:8000],
     )
-    return result.embedding
+    return result.embeddings[0].values
 
 
 def embed_batch(texts: list[str]) -> list[list[float]]:
