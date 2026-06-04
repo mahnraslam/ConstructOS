@@ -7,10 +7,12 @@ venv/
 *.egg
 
 # Environment
+backend/.env
 .env
 .env.local
 
 # Node
+
 frontend/node_modules/
 dist/
 
