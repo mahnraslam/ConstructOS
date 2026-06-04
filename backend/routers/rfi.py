@@ -31,6 +31,6 @@ def generate_rfis(body: GenerateRequest, db: Session = Depends(get_db)):
 
 @router.get("/project/{project_id}", response_model=RFIListResponse)
 def get_rfis(project_id: str, db: Session = Depends(get_db)):
-    """Return stored RFIs for a project."""
+    """Return stored RFIs for a project (Bug 3 fix: restore persisted references)."""
     rfis = get_stored_rfis(project_id, db)
     return RFIListResponse(project_id=project_id, rfis=rfis, total=len(rfis))

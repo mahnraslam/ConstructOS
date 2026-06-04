@@ -96,9 +96,33 @@ class RFI(Base):
     created_at   = Column(DateTime, server_default=func.now())
     project      = relationship("Project", back_populates="rfis")
 
+def _auto_migrate():
+    """
+    Lightweight migration: add any columns defined in ORM models but missing
+    from the existing SQLite tables.  Avoids a full Alembic dependency for
+    simple ALTER TABLE ADD COLUMN operations.
+    """
+    from sqlalchemy import inspect as sa_inspect, text
+    inspector = sa_inspect(engine)
+    for table_name, table_obj in Base.metadata.tables.items():
+        if table_name not in inspector.get_table_names():
+            continue  # table doesn't exist yet — create_all handles it
+        existing_cols = {c["name"] for c in inspector.get_columns(table_name)}
+        for col in table_obj.columns:
+            if col.name not in existing_cols:
+                col_type = col.type.compile(engine.dialect)
+                default_clause = ""
+                if col.default is not None:
+                    default_clause = f" DEFAULT {col.default.arg!r}"
+                elif col.nullable:
+                    default_clause = " DEFAULT NULL"
+                stmt = f"ALTER TABLE {table_name} ADD COLUMN {col.name} {col_type}{default_clause}"
+                with engine.begin() as conn:
+                    conn.execute(text(stmt))
 
 def init_db():
     Base.metadata.create_all(bind=engine)
+    _auto_migrate()
 
 
 def get_db():
