@@ -5,7 +5,8 @@ import base64
 from google import genai
 from dotenv import load_dotenv
  
-load_dotenv()
+_ENV_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '.env')
+load_dotenv(_ENV_PATH, override=True)
 
 logger = logging.getLogger(__name__)
 
@@ -16,8 +17,9 @@ if not _API_KEY or _API_KEY in ("your_key_here", "your_gemini_api_key_here", "te
 # Initialize new google-genai SDK
 _client = genai.Client(api_key=_API_KEY)
 
-_GEN_MODEL   = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
-_EMBED_MODEL = "gemini-embedding-001"
+_GEN_MODEL   = os.getenv("GEMINI_MODEL", "gemini-2.5-flash").removeprefix("models/")
+_EMBED_MODEL = os.getenv("GEMINI_EMBED_MODEL", "gemini-embedding-001").removeprefix("models/")
+logger.info(f"[gemini] Using generation model: {_GEN_MODEL}, embed model: {_EMBED_MODEL}")
  
 MAX_RETRIES = 2
 def embed_text(text: str) -> list[float]:
@@ -53,21 +55,32 @@ def embed_batch(texts: list[str]) -> list[list[float]]:
 
 
 def generate(prompt: str) -> str:
-    """Plain text generation using gemini-2.0-flash."""
-    try:
-        response = _client.models.generate_content(
-            model=_GEN_MODEL,
-            contents=prompt,
-        )
-        return response.text
-    except Exception as e:
-        logger.error(f"[gemini] Generation failed: {e}")
-        return f"[Gemini error: {e}]"
+    import time
+    for attempt in range(3):
+        try:
+            return _client.models.generate_content(model=_GEN_MODEL, contents=prompt).text
+        except Exception as e:
+            err = str(e)
+            retryable = ("429" in err or "RESOURCE_EXHAUSTED" in err
+                         or "503" in err or "UNAVAILABLE" in err
+                         or "overloaded" in err.lower())
+            if retryable and attempt < 2:
+                m = re.search(r"retryDelay.*?['\"](\d+)s['\"]", err)
+                wait = int(m.group(1)) if m else 30 * (2 ** attempt)
+                logger.warning(f"[gemini] Retryable error, waiting {wait}s (attempt {attempt+1}/3): {err[:120]}")
+                time.sleep(wait)
+                continue
+            logger.error(f"[gemini] Generation failed: {e}")
+            return f"[Gemini error: {e}]"
+    return "[Gemini error: max retries exceeded]"
 
 
 def generate_json(prompt: str) -> str:
     """Generation expected to return JSON — caller parses."""
     raw = generate(prompt)
+    # Detect Gemini error strings that would silently fail json.loads
+    if raw.startswith("[Gemini error:"):
+        raise ValueError(f"LLM generation failed: {raw}")
     cleaned = re.sub(r'^```(?:json)?\s*\n?', '', raw.strip())
     cleaned = re.sub(r'\n?```\s*$', '', cleaned)
     return cleaned.strip()

@@ -3,7 +3,8 @@ import chromadb
 from models.schemas import DocumentMeta
 from dotenv import load_dotenv
 
-load_dotenv()
+_ENV_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '.env')
+load_dotenv(_ENV_PATH, override=True)
 
 _CHROMA_PATH = os.getenv("CHROMA_PATH", "storage/chroma_db")
 _client = chromadb.PersistentClient(path=_CHROMA_PATH)
@@ -57,6 +58,29 @@ def query(
     return items
 
 
+def get_all_by_doc_id(doc_id: str) -> list[dict]:
+    """Retrieve ALL chunks for a document deterministically (no semantic search)."""
+    results = _col.get(
+        where={"doc_id": doc_id},
+        include=["documents", "metadatas"],
+    )
+    if not results["ids"]:
+        return []
+    items = []
+    for i in range(len(results["ids"])):
+        meta = results["metadatas"][i]
+        items.append({
+            "text":     results["documents"][i],
+            "doc_id":   meta["doc_id"],
+            "filename": meta["filename"],
+            "page":     meta["page"],
+            "doc_type": meta.get("doc_type", "other"),
+        })
+    # Sort by page number for consistent processing order
+    items.sort(key=lambda x: x["page"])
+    return items
+
+
 def list_documents() -> list[DocumentMeta]:
     """List all unique documents with correct page_count and chunk_count."""
     all_meta = (_col.get(include=["metadatas"])["metadatas"]) or []
@@ -73,7 +97,7 @@ def list_documents() -> list[DocumentMeta]:
         DocumentMeta(
             doc_id      = did,
             filename    = info["filename"],
-            page_count  = max(info["pages"]) if info["pages"] else 0,
+            page_count  = len(info["pages"]),
             chunk_count = info["chunks"],
             doc_type    = info["doc_type"],
         )

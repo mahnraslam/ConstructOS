@@ -8,6 +8,8 @@ class DocumentMeta(BaseModel):
     page_count: int = 0
     chunk_count: int = 0
     doc_type: str = "other"
+    fact_count: Optional[int] = None
+    fact_extraction_error: Optional[str] = None
 
 class DeleteResponse(BaseModel):
     doc_id: str

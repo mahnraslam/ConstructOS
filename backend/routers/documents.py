@@ -1,4 +1,4 @@
-import os, uuid, shutil
+import os, uuid, shutil, glob, logging
 from fastapi import APIRouter, UploadFile, File, Form, HTTPException, Depends
 from sqlalchemy.orm import Session
 from services.pdf_parser import parse
@@ -9,9 +9,13 @@ from models.schemas import DocumentMeta, DeleteResponse
 from db import get_db, ProjectDocument, SessionLocal
 from dotenv import load_dotenv
 
-load_dotenv()
+_ENV_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '.env')
+load_dotenv(_ENV_PATH, override=True)
+
+logger     = logging.getLogger(__name__)
 router     = APIRouter()
 UPLOAD_DIR = os.getenv("UPLOAD_PATH", "storage/uploads")
+PAGES_DIR  = os.getenv("PAGES_PATH", "storage/pages")
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
 DOC_TYPES = {"blueprint", "specification", "boq", "method_statement", "submittal", "rfi", "om_manual", "other"}
@@ -56,7 +60,25 @@ async def upload_document(
         raise HTTPException(500, f"PDF parsing failed: {e}")
     if not chunks:
         raise HTTPException(422, "No readable content found in PDF.")
+
+    # Bug 9 fix: clean up old vectors if re-uploading same file to same project
+    if project_id:
+        existing = db.query(ProjectDocument).filter(
+            ProjectDocument.project_id == project_id,
+            ProjectDocument.filename == file.filename,
+        ).first()
+        if existing:
+            logger.info(f"[documents] Re-upload detected for {file.filename}, cleaning old doc_id={existing.id}")
+            vector_store.delete_document(existing.id)
+            _cleanup_files(existing.id)
+            db.delete(existing)
+            db.commit()
+
     embed_and_store(chunks, doc_id, file.filename, resolved_type)
+
+    # Track fact extraction result for response (Bug 1 fix)
+    fact_count = None
+    fact_error = None
 
     # Persist to DB if project_id given
     if project_id:
@@ -69,7 +91,7 @@ async def upload_document(
         db.commit()
         # Auto-trigger fact extraction for pipeline activation
         try:
-            extract_facts_for_document(
+            fact_count = extract_facts_for_document(
                 doc_id=doc_id,
                 project_id=project_id,
                 filename=file.filename,
@@ -77,13 +99,17 @@ async def upload_document(
                 db=db,
             )
         except Exception as e:
-            # Log but don't block upload
-            import logging
-            logging.error(f"[documents] Fact extraction failed for {doc_id}: {e}")
+            # Bug 1 fix: capture error message instead of silently swallowing
+            fact_error = str(e)
+            logger.error(f"[documents] Fact extraction failed for {doc_id}: {e}")
 
-    return DocumentMeta(doc_id=doc_id, filename=file.filename,
-                        page_count=page_count, chunk_count=len(chunks),
-                        doc_type=resolved_type)
+    return DocumentMeta(
+        doc_id=doc_id, filename=file.filename,
+        page_count=page_count, chunk_count=len(chunks),
+        doc_type=resolved_type,
+        fact_count=fact_count,
+        fact_extraction_error=fact_error,
+    )
 
 
 @router.get("/", response_model=list[DocumentMeta])
@@ -94,6 +120,8 @@ def list_documents():
 @router.delete("/{doc_id}", response_model=DeleteResponse)
 def delete_document(doc_id: str, db: Session = Depends(get_db)):
     vector_store.delete_document(doc_id)
+    # Bug 5 fix: clean up uploaded PDF and page images from disk
+    _cleanup_files(doc_id)
     # Remove DB entry if exists
     pd = db.query(ProjectDocument).filter(ProjectDocument.id == doc_id).first()
     if pd:
@@ -108,3 +136,21 @@ def page_url(doc_id: str, page_num: int):
     path = os.path.join(pages_path, f"{doc_id}_page_{page_num}.png")
     return {"exists": os.path.isfile(path),
             "url": f"/pages/{doc_id}_page_{page_num}.png"}
+
+
+def _cleanup_files(doc_id: str):
+    """Remove uploaded PDF and rendered page images for a document."""
+    # Remove uploaded PDF
+    for f in glob.glob(os.path.join(UPLOAD_DIR, f"{doc_id}_*")):
+        try:
+            os.remove(f)
+            logger.info(f"[documents] Removed upload: {f}")
+        except OSError as e:
+            logger.warning(f"[documents] Could not remove {f}: {e}")
+    # Remove page images
+    for f in glob.glob(os.path.join(PAGES_DIR, f"{doc_id}_page_*.png")):
+        try:
+            os.remove(f)
+            logger.info(f"[documents] Removed page image: {f}")
+        except OSError as e:
+            logger.warning(f"[documents] Could not remove {f}: {e}")

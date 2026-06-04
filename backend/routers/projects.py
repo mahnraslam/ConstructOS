@@ -1,10 +1,12 @@
-import uuid
+import uuid, os, glob, logging
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 from pydantic import BaseModel
 from typing import List, Optional
 from db import get_db, Project, ProjectDocument
+from services import vector_store
 
+logger = logging.getLogger(__name__)
 router = APIRouter()
 
 # ── Schemas ──────────────────────────────────────────────────────────────────
@@ -75,6 +77,33 @@ def delete_project(project_id: str, db: Session = Depends(get_db)):
     p = db.query(Project).filter(Project.id == project_id).first()
     if not p:
         raise HTTPException(404, "Project not found")
+
+    # Bug 2 fix: clean up ChromaDB vectors and disk files BEFORE deleting DB rows
+    upload_dir = os.getenv("UPLOAD_PATH", "storage/uploads")
+    pages_dir  = os.getenv("PAGES_PATH", "storage/pages")
+    docs = db.query(ProjectDocument).filter(ProjectDocument.project_id == project_id).all()
+    for doc in docs:
+        # Remove vectors from ChromaDB
+        try:
+            vector_store.delete_document(doc.id)
+        except Exception as e:
+            logger.warning(f"[projects] Failed to delete vectors for doc {doc.id}: {e}")
+        # Remove uploaded PDF files
+        for f in glob.glob(os.path.join(upload_dir, f"{doc.id}_*")):
+            try:
+                os.remove(f)
+            except OSError:
+                pass
+        # Remove page images
+        for f in glob.glob(os.path.join(pages_dir, f"{doc.id}_page_*.png")):
+            try:
+                os.remove(f)
+            except OSError:
+                pass
+
+    logger.info(f"[projects] Cleaned up {len(docs)} documents for project {project_id}")
+
+    # Cascade delete handles ProjectDocuments, Facts, Conflicts, RFIs in SQLite
     db.delete(p)
     db.commit()
     return {"deleted": True}

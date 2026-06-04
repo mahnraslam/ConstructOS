@@ -92,15 +92,17 @@ def generate_project_rfis(project_id: str, db: Session) -> list[RFIItem]:
                 quote         = conflict.spec_value,
             ))
 
-        # Persist
+        # Persist (Bug 3 fix: serialize references to JSON)
+        refs_data = [ref.model_dump() for ref in references]
         db.add(RFIRow(
-            project_id  = project_id,
-            conflict_id = conflict.id,
-            number      = number,
-            subject     = subject,
-            body        = body,
-            priority    = conflict.severity,
-            status      = "open",
+            project_id      = project_id,
+            conflict_id     = conflict.id,
+            number          = number,
+            subject         = subject,
+            body            = body,
+            priority        = conflict.severity,
+            status          = "open",
+            references_json = refs_data,
         ))
 
         rfis.append(RFIItem(number=number, subject=subject, body=body,
@@ -112,10 +114,15 @@ def generate_project_rfis(project_id: str, db: Session) -> list[RFIItem]:
 
 
 def get_stored_rfis(project_id: str, db: Session) -> list[RFIItem]:
-    """Return stored RFIs for a project."""
+    """Return stored RFIs for a project (Bug 3 fix: restore persisted references)."""
     rows = db.query(RFIRow).filter(RFIRow.project_id == project_id).all()
-    return [
-        RFIItem(number=r.number, subject=r.subject, body=r.body,
-                priority=r.priority, references=[])
-        for r in rows
-    ]
+    result = []
+    for r in rows:
+        refs = []
+        if r.references_json:
+            refs = [Reference(**ref_data) for ref_data in r.references_json]
+        result.append(RFIItem(
+            number=r.number, subject=r.subject, body=r.body,
+            priority=r.priority, references=refs,
+        ))
+    return result

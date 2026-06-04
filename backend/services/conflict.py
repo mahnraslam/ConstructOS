@@ -33,17 +33,23 @@ def detect_fact_conflicts(project_id: str, db: Session) -> FactConflictResponse:
     Compare blueprint facts vs spec facts for a project.
     Matching is deterministic: normalise values → compare → flag differences.
     """
+    # Bug 11 fix: single query to build doc_id → doc_type lookup (was N+1)
+    project_docs = db.query(ProjectDocument).filter(
+        ProjectDocument.project_id == project_id
+    ).all()
+    doc_type_map: dict[str, str] = {d.id: d.document_type for d in project_docs}
+
     # Gather all facts grouped by document type
     bp_facts: list[Fact]   = []
     spec_facts: list[Fact] = []
 
     for fact in db.query(Fact).filter(Fact.project_id == project_id).all():
-        doc = db.query(ProjectDocument).filter(ProjectDocument.id == fact.document_id).first()
-        if not doc:
+        dt = doc_type_map.get(fact.document_id)
+        if not dt:
             continue
-        if doc.document_type in BLUEPRINT_TYPES:
+        if dt in BLUEPRINT_TYPES:
             bp_facts.append(fact)
-        elif doc.document_type in SPEC_TYPES:
+        elif dt in SPEC_TYPES:
             spec_facts.append(fact)
 
     # Build lookup: field -> list[Fact] for each side

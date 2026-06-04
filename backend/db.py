@@ -92,6 +92,7 @@ class RFI(Base):
     body         = Column(Text)
     priority     = Column(String, default="medium")
     status       = Column(String, default="open")
+    references_json = Column(JSON, nullable=True, default=None)  # persisted Reference list
     created_at   = Column(DateTime, server_default=func.now())
     project      = relationship("Project", back_populates="rfis")
 

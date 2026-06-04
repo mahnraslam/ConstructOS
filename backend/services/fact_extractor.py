@@ -9,10 +9,12 @@ Fact fields extracted:
   Architectural: wall_type, door_schedule, floor_finish
   MEP         : pipe_size, cable_size, equipment
 """
+import re
+import time
 import json
 import logging
 from sqlalchemy.orm import Session
-from services import embedder, vector_store
+from services import vector_store
 from services.gemini import generate_json
 from db import Fact, ProjectDocument
 
@@ -59,58 +61,101 @@ def extract_facts_for_document(
     db: Session,
 ) -> int:
     """
-    Extract facts from all chunks of a document and store in DB.
+    Extract facts from ALL chunks of a document and store in DB.
     Returns count of facts stored.
     """
     # Delete existing facts for this doc to avoid duplicates on re-run
     db.query(Fact).filter(Fact.document_id == doc_id).delete()
     db.commit()
 
-    # Retrieve all chunks for this doc via vector_store
-    all_chunks = _get_all_chunks(doc_id)
+    # Retrieve ALL chunks deterministically (Bug 4/7 fix)
+    all_chunks = vector_store.get_all_by_doc_id(doc_id)
     if not all_chunks:
         logger.warning(f"[facts] No chunks found for doc_id={doc_id}")
         return 0
 
-    total = 0
+    logger.info(f"[facts] Processing {len(all_chunks)} chunks for doc_id={doc_id}")
+
+    # Track all extracted facts for deduplication
+    all_facts: list[dict] = []
+    llm_errors = 0
+
     for category, fields in FACT_CATEGORIES.items():
-        category_query = " ".join(fields)
-        q_emb  = embedder.embed_query(category_query)
-        # Increased n to 15 to capture more of the document
-        chunks = vector_store.query(q_emb, [doc_id], n=15)
-
-        for chunk in chunks:
-            if chunk["relevance_score"] < 0.15:   # lowered threshold
-                continue
+        for chunk in all_chunks:
             facts = _extract_from_chunk(chunk, filename, doc_type, fields)
+            if facts is None:
+                # LLM error occurred for this chunk
+                llm_errors += 1
+                continue
             for f in facts:
-                db.add(Fact(
-                    project_id  = project_id,
-                    document_id = doc_id,
-                    category    = category,
-                    field       = f.get("field", ""),
-                    value       = f.get("value", ""),
-                    unit        = f.get("unit", ""),
-                    page        = chunk["page"],
-                    sheet       = f.get("sheet", ""),
-                    section     = f.get("section", ""),
-                    quote       = f.get("quote", ""),
-                ))
-                total += 1
+                all_facts.append({
+                    "project_id":  project_id,
+                    "document_id": doc_id,
+                    "category":    category,
+                    "field":       f.get("field", ""),
+                    "value":       f.get("value", ""),
+                    "unit":        f.get("unit", ""),
+                    "page":        chunk["page"],
+                    "sheet":       f.get("sheet", ""),
+                    "section":     f.get("section", ""),
+                    "quote":       f.get("quote", ""),
+                })
 
+        # Brief rate-limit pause between categories (Bug 12 fix: was 5s)
+        time.sleep(1)
+
+    # Deduplicate facts (Bug 8 fix)
+    deduped = _deduplicate_facts(all_facts)
+
+    # Persist to DB
+    for f in deduped:
+        db.add(Fact(**f))
     db.commit()
-    logger.info(f"[facts] Extracted {total} facts for doc_id={doc_id}")
-    return total
+
+    logger.info(
+        f"[facts] Extracted {len(deduped)} unique facts "
+        f"(from {len(all_facts)} raw, {llm_errors} LLM errors) "
+        f"for doc_id={doc_id}"
+    )
+    return len(deduped)
 
 
-def _get_all_chunks(doc_id: str) -> list[dict]:
-    """Retrieve all chunks for a doc via a broad semantic query."""
-    q_emb = embedder.embed_query("construction specification dimensions material grade")
-    return vector_store.query(q_emb, [doc_id], n=20)
+def _deduplicate_facts(facts: list[dict]) -> list[dict]:
+    """
+    Deduplicate facts by (category, field, normalized_value).
+    Keeps the first occurrence (earliest page reference).
+    """
+    seen: set[tuple] = set()
+    unique: list[dict] = []
+    for f in facts:
+        key = (
+            f["category"],
+            _normalise_field(f["field"]),
+            _normalise_value(f["value"]),
+        )
+        if key not in seen:
+            seen.add(key)
+            unique.append(f)
+    return unique
 
 
-def _extract_from_chunk(chunk: dict, filename: str, doc_type: str, fields: list[str]) -> list[dict]:
-    """Call LLM to extract facts from a single chunk."""
+def _normalise_field(field: str) -> str:
+    return field.strip().lower().replace(" ", "_").replace("-", "_")
+
+
+def _normalise_value(raw: str) -> str:
+    v = raw.strip().lower()
+    v = re.sub(r"(\d)\s*(mm|cm|m|mpa|n/mm2|kn|kpa|kg)", r"\1 \2", v)
+    return v
+
+
+def _extract_from_chunk(
+    chunk: dict, filename: str, doc_type: str, fields: list[str]
+) -> list[dict] | None:
+    """
+    Call LLM to extract facts from a single chunk.
+    Returns list of facts, or None if LLM call failed.
+    """
     prompt = _EXTRACT_PROMPT.format(
         filename = filename,
         doc_type = doc_type,
@@ -118,7 +163,13 @@ def _extract_from_chunk(chunk: dict, filename: str, doc_type: str, fields: list[
         text     = chunk["text"][:1200],
         fields   = ", ".join(fields),
     )
-    raw = generate_json(prompt).strip()
+    try:
+        raw = generate_json(prompt).strip()
+    except ValueError as e:
+        # Bug 6 fix: generate_json now raises on Gemini error strings
+        logger.warning(f"[facts] LLM error for chunk page={chunk['page']}: {e}")
+        return None
+
     try:
         result = json.loads(raw)
         if isinstance(result, list):
