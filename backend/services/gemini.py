@@ -4,7 +4,7 @@ import logging
 import base64
 from google import genai
 from dotenv import load_dotenv
- 
+
 _ENV_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '.env')
 load_dotenv(_ENV_PATH, override=True)
 
@@ -14,16 +14,37 @@ _API_KEY = os.getenv("GEMINI_API_KEY", "")
 if not _API_KEY or _API_KEY in ("your_key_here", "your_gemini_api_key_here", "test-key"):
     logger.warning("[gemini] GEMINI_API_KEY is not set or is a placeholder. LLM calls will fail.")
 
-# Initialize new google-genai SDK
+# Initialize Gemini client (used for embeddings only)
 _client = genai.Client(api_key=_API_KEY)
 
-_GEN_MODEL   = os.getenv("GEMINI_MODEL", "gemini-2.5-flash").removeprefix("models/")
+_GEN_MODEL   = os.getenv("GEMINI_MODEL", "gemini-2.0-flash").removeprefix("models/")
 _EMBED_MODEL = os.getenv("GEMINI_EMBED_MODEL", "gemini-embedding-001").removeprefix("models/")
-logger.info(f"[gemini] Using generation model: {_GEN_MODEL}, embed model: {_EMBED_MODEL}")
- 
+logger.info(f"[gemini] Embed model: {_EMBED_MODEL} | Generation: Groq (llama-3.3-70b)")
+
+# ── Groq client for text generation ──────────────────────────────────────────
+
+_GROQ_API_KEY  = os.getenv("GROQ_API_KEY", "")
+_GROQ_MODEL    = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
+_groq_client   = None
+
+if _GROQ_API_KEY:
+    try:
+        from groq import Groq
+        _groq_client = Groq(api_key=_GROQ_API_KEY)
+        logger.info(f"[groq] Client ready — model: {_GROQ_MODEL}")
+    except Exception as e:
+        logger.warning(f"[groq] Failed to initialise: {e}")
+else:
+    logger.warning("[groq] GROQ_API_KEY not set — generation calls will fall back to Gemini")
+
+
 MAX_RETRIES = 2
+
+
+# ── Embeddings (Gemini — working fine) ───────────────────────────────────────
+
 def embed_text(text: str) -> list[float]:
-    """Embed a single string using text-embedding-004 → 768-dim vector."""
+    """Embed a single string using gemini-embedding-001 → vector."""
     if len(text) > 8000:
         logger.warning(f"[gemini] Text truncated from {len(text)} to 8000 chars for embedding")
     result = _client.models.embed_content(
@@ -54,7 +75,40 @@ def embed_batch(texts: list[str]) -> list[list[float]]:
     return embeddings
 
 
+# ── Text generation (Groq primary, Gemini fallback) ──────────────────────────
+
 def generate(prompt: str) -> str:
+    """Generate text — uses Groq if available, falls back to Gemini."""
+    if _groq_client:
+        return _groq_generate(prompt)
+    return _gemini_generate(prompt)
+
+
+def _groq_generate(prompt: str) -> str:
+    import time
+    for attempt in range(3):
+        try:
+            response = _groq_client.chat.completions.create(
+                model=_GROQ_MODEL,
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=1024,
+                temperature=0.1,
+            )
+            return response.choices[0].message.content
+        except Exception as e:
+            err = str(e)
+            retryable = "429" in err or "rate_limit" in err.lower() or "503" in err
+            if retryable and attempt < 2:
+                wait = 30 * (2 ** attempt)
+                logger.warning(f"[groq] Retryable error, waiting {wait}s (attempt {attempt+1}/3): {err[:120]}")
+                time.sleep(wait)
+                continue
+            logger.error(f"[groq] Generation failed: {e} — falling back to Gemini")
+            return _gemini_generate(prompt)
+    return _gemini_generate(prompt)
+
+
+def _gemini_generate(prompt: str) -> str:
     import time
     for attempt in range(3):
         try:
@@ -78,8 +132,7 @@ def generate(prompt: str) -> str:
 def generate_json(prompt: str) -> str:
     """Generation expected to return JSON — caller parses."""
     raw = generate(prompt)
-    # Detect Gemini error strings that would silently fail json.loads
-    if raw.startswith("[Gemini error:"):
+    if raw.startswith("[Gemini error:") or raw.startswith("[Groq error:"):
         raise ValueError(f"LLM generation failed: {raw}")
     cleaned = re.sub(r'^```(?:json)?\s*\n?', '', raw.strip())
     cleaned = re.sub(r'\n?```\s*$', '', cleaned)
@@ -88,8 +141,9 @@ def generate_json(prompt: str) -> str:
 
 def generate_with_images(prompt: str, image_paths: list[str]) -> str:
     """
-    Multimodal generation: send text prompt together with one or more page
-    images so Gemini can see the drawings when formulating its answer.
+    Multimodal generation with page images.
+    Groq does not support vision, so this always uses Gemini directly.
+    If Gemini quota is exhausted, falls back to text-only via Groq.
     """
     content: list = []
     loaded = 0
@@ -110,29 +164,20 @@ def generate_with_images(prompt: str, image_paths: list[str]) -> str:
         return generate(prompt)
 
     content.append(prompt)
-
     try:
         logger.info(f"[gemini] Multimodal generation with {loaded} page image(s)")
-        response = _client.models.generate_content(
-            model=_GEN_MODEL,
-            contents=content,
-        )
+        response = _client.models.generate_content(model=_GEN_MODEL, contents=content)
         return response.text
     except Exception as e:
-        logger.error(f"[gemini] Multimodal generation failed: {e}")
-        logger.info("[gemini] Falling back to text-only generation")
+        logger.warning(f"[gemini] Multimodal failed ({e}) — falling back to text-only via Groq")
         return generate(prompt)
 
 
 def describe_blueprint_page(image_path: str) -> str:
-    """
-    Vision call: extract technical information from a blueprint page image.
-    Called for drawing-heavy pages where text extraction yields < 200 chars.
-    """
+    """Vision call: extract technical info from a blueprint page image (Gemini only)."""
     try:
         with open(image_path, "rb") as f:
             image_data = base64.b64encode(f.read()).decode("utf-8")
-
         img_part = {"mime_type": "image/png", "data": image_data}
         prompt = (
             "You are analysing a construction engineering drawing. "
@@ -147,10 +192,7 @@ def describe_blueprint_page(image_path: str) -> str:
             "Be precise and technical. Format as a numbered structured list. "
             "If a section has nothing visible, skip it."
         )
-        response = _client.models.generate_content(
-            model=_GEN_MODEL,
-            contents=[img_part, prompt],
-        )
+        response = _client.models.generate_content(model=_GEN_MODEL, contents=[img_part, prompt])
         return response.text
     except Exception as e:
         logger.error(f"[gemini] Vision failed for {image_path}: {e}")

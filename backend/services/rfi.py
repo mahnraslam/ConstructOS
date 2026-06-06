@@ -8,25 +8,33 @@ references) is deterministic and comes from the conflict detection step.
 import logging
 from sqlalchemy.orm import Session
 from db import Conflict, ProjectDocument, RFI as RFIRow
-from services.gemini import generate
 from models.schemas import RFIItem, RFIResponse, Reference
 
 logger = logging.getLogger(__name__)
 
-_RFI_PROMPT = """You are a construction RFI drafter. Write a professional Request for Information.
 
-Conflict:
-- Field: {field}
-- Blueprint ({blueprint_doc}, Page {bp_page}{bp_sheet}): {blueprint_value}
-- Specification ({spec_doc}, Page {sp_page}{sp_section}): {spec_value}
+def _build_rfi_body(
+    field: str,
+    blueprint_doc: str, bp_page: int, bp_sheet: str, blueprint_value: str,
+    spec_doc: str, sp_page: int, sp_section: str, spec_value: str,
+) -> str:
+    """
+    Generate a professional RFI body deterministically — no LLM, no API calls.
+    Produces consistent, readable output from the conflict data alone.
+    """
+    field_label = field.replace("_", " ").title()
+    bp_ref = f"Page {bp_page}" + (f", Sheet {bp_sheet}" if bp_sheet else "")
+    sp_ref = f"Page {sp_page}" + (f", {sp_section}" if sp_section else "")
 
-Write a concise RFI body (3–5 sentences):
-1. State what the blueprint shows
-2. State what the specification requires
-3. Ask for clarification on which value is correct
-4. Optionally suggest a resolution
-
-Be professional and precise. Do not add a subject line or RFI number — just the body text."""
+    return (
+        f"The construction drawings ({blueprint_doc}, {bp_ref}) indicate "
+        f"{field_label} as {blueprint_value}. "
+        f"However, the project specification ({spec_doc}, {sp_ref}) requires "
+        f"{field_label} to be {spec_value}. "
+        f"These two documents are in conflict and cannot both be satisfied as currently issued. "
+        f"Please clarify which value governs and issue a revised document or written directive "
+        f"so that construction may proceed accordingly."
+    )
 
 
 def generate_project_rfis(project_id: str, db: Session) -> list[RFIItem]:
@@ -55,22 +63,17 @@ def generate_project_rfis(project_id: str, db: Session) -> list[RFIItem]:
     for i, conflict in enumerate(conflicts, 1):
         bp_doc  = doc_names.get(conflict.blueprint_doc_id or "", "Blueprint")
         sp_doc  = doc_names.get(conflict.spec_doc_id or "", "Specification")
-        bp_sheet  = f", Sheet {conflict.blueprint_sheet}" if conflict.blueprint_sheet else ""
-        sp_section = f", {conflict.spec_section}" if conflict.spec_section else ""
-
-        prompt = _RFI_PROMPT.format(
-            field           = conflict.field.replace("_", " ").title(),
+        body = _build_rfi_body(
+            field           = conflict.field,
             blueprint_doc   = bp_doc,
-            bp_page         = conflict.blueprint_page,
-            bp_sheet        = bp_sheet,
+            bp_page         = conflict.blueprint_page or 0,
+            bp_sheet        = conflict.blueprint_sheet or "",
             blueprint_value = conflict.blueprint_value,
             spec_doc        = sp_doc,
-            sp_page         = conflict.spec_page,
-            sp_section      = sp_section,
+            sp_page         = conflict.spec_page or 0,
+            sp_section      = conflict.spec_section or "",
             spec_value      = conflict.spec_value,
         )
-
-        body = generate(prompt)
         number = f"RFI-{i:03d}"
         subject = f"{conflict.field.replace('_', ' ').title()} Discrepancy"
 
