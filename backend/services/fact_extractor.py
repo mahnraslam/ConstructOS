@@ -1,13 +1,57 @@
+"""
+Fact Extraction Service
+-----------------------
+Extracts structured construction facts from document chunks via LLM and
+stores them in SQLite. Facts are categorised as structural, architectural, or MEP.
+
+Fact fields extracted:
+  Structural : slab_thickness, beam_size, column_size, concrete_grade, rebar
+  Architectural: wall_type, door_schedule, floor_finish
+  MEP         : pipe_size, cable_size, equipment
+"""
 import re
+import time
+import json
 import logging
 from sqlalchemy.orm import Session
 from services import vector_store
+from services.gemini import generate_json
 from db import Fact, ProjectDocument
 
 logger = logging.getLogger(__name__)
 
+# Topics and their fact fields
+FACT_CATEGORIES = {
+    "structural": [
+        "slab_thickness", "beam_size", "column_size",
+        "concrete_grade", "rebar", "foundation_depth",
+    ],
+    "architectural": [
+        "wall_type", "wall_thickness", "door_schedule",
+        "floor_finish", "ceiling_height",
+    ],
+    "mep": [
+        "pipe_size", "cable_size", "equipment",
+        "duct_size", "conduit_size",
+    ],
+}
 
-# ── Public API ────────────────────────────────────────────────────────────────
+_EXTRACT_PROMPT = """You are a construction document parser. Extract ONLY the facts explicitly stated in the following text.
+
+Document: {filename} (type: {doc_type}), Page {page}
+
+TEXT:
+{text}
+
+Extract facts for these fields (only if clearly stated with a value):
+{fields}
+
+Respond with ONLY a JSON array. Each item:
+{{"field": "field_name", "value": "exact value as written", "unit": "mm or MPa etc", "sheet": "sheet ref if any", "section": "section ref if any", "quote": "exact phrase from text (max 100 chars)"}}
+
+If no facts found, respond with: []
+Do not invent or infer values not explicitly in the text."""
+
 
 def extract_facts_for_document(
     doc_id: str,
@@ -16,311 +60,144 @@ def extract_facts_for_document(
     doc_type: str,
     db: Session,
 ) -> int:
-    """Extract facts via regex — no LLM, no API calls, no rate limits."""
+    """
+    Extract facts from ALL chunks of a document and store in DB.
+    Returns count of facts stored.
+    """
+    # Delete existing facts for this doc to avoid duplicates on re-run
     db.query(Fact).filter(Fact.document_id == doc_id).delete()
     db.commit()
 
-    chunks = vector_store.get_all_by_doc_id(doc_id)
-    if not chunks:
+    # Retrieve ALL chunks deterministically (Bug 4/7 fix)
+    all_chunks = vector_store.get_all_by_doc_id(doc_id)
+    if not all_chunks:
         logger.warning(f"[facts] No chunks found for doc_id={doc_id}")
         return 0
 
-    # Combine all pages into one searchable string
-    full_text = "\n".join(c["text"] for c in chunks)
-    logger.info(f"[facts] Regex-extracting from '{filename}' ({len(chunks)} chunks, {len(full_text)} chars)")
+    logger.info(f"[facts] Processing {len(all_chunks)} chunks for doc_id={doc_id}")
 
+    # Track all extracted facts for deduplication
     all_facts: list[dict] = []
-    all_facts += _extract_door_schedule(full_text, doc_id, project_id)
-    all_facts += _extract_window_schedule(full_text, doc_id, project_id)
-    all_facts += _extract_u_factor(full_text, doc_id, project_id)
-    all_facts += _extract_header_schedule(full_text, doc_id, project_id)
-    all_facts += _extract_room_finishes(full_text, doc_id, project_id)
+    llm_errors = 0
 
-    # Deduplicate by (field, normalised_value)
-    seen: set[tuple] = set()
-    unique: list[dict] = []
-    for f in all_facts:
-        key = (f["field"], _norm(f["value"]))
-        if key not in seen:
-            seen.add(key)
-            unique.append(f)
+    for category, fields in FACT_CATEGORIES.items():
+        for chunk in all_chunks:
+            facts = _extract_from_chunk(chunk, filename, doc_type, fields)
+            if facts is None:
+                # LLM error occurred for this chunk
+                llm_errors += 1
+                continue
+            for f in facts:
+                all_facts.append({
+                    "project_id":  project_id,
+                    "document_id": doc_id,
+                    "category":    category,
+                    "field":       f.get("field", ""),
+                    "value":       f.get("value", ""),
+                    "unit":        f.get("unit", ""),
+                    "page":        chunk["page"],
+                    "sheet":       f.get("sheet", ""),
+                    "section":     f.get("section", ""),
+                    "quote":       f.get("quote", ""),
+                })
 
-    for f in unique:
+        # Brief rate-limit pause between categories (Bug 12 fix: was 5s)
+        time.sleep(1)
+
+    # Deduplicate facts (Bug 8 fix)
+    deduped = _deduplicate_facts(all_facts)
+
+    # Persist to DB
+    for f in deduped:
         db.add(Fact(**f))
     db.commit()
 
-    logger.info(f"[facts] Stored {len(unique)} facts for '{filename}'")
-    return len(unique)
-
-
-def get_facts_for_project(project_id: str, db: Session) -> list[dict]:
-    """Return all facts for a project with document filename."""
-    rows = db.query(Fact, ProjectDocument.filename).join(
-        ProjectDocument, Fact.document_id == ProjectDocument.id
-    ).filter(Fact.project_id == project_id).all()
-    return [
-        {
-            "id":          r.Fact.id,
-            "category":    r.Fact.category,
-            "field":       r.Fact.field,
-            "value":       r.Fact.value,
-            "unit":        r.Fact.unit,
-            "page":        r.Fact.page,
-            "sheet":       r.Fact.sheet,
-            "section":     r.Fact.section,
-            "quote":       r.Fact.quote,
-            "document_id": r.Fact.document_id,
-            "filename":    r.filename,
-        }
-        for r in rows
-    ]
-
-
-# ── Extractors ────────────────────────────────────────────────────────────────
-
-def _extract_door_schedule(text: str, doc_id: str, project_id: str) -> list[dict]:
-    """
-    Section 08100 — Door Schedule.
-    Matches: 102  3/0x6/8  INT  NO  ...
-             109  (2)2/4x6/8  INT  NO  ...
-    Covers defects: D-01 to D-06.
-    """
-    facts = []
-    pattern = re.compile(
-        r'\b(\d{3})\s+'                           # door number e.g. 102
-        r'((?:\(\d+\))?[\d]+/[\d]+x[\d]+/[\d]+)' # size e.g. 3/0x6/8 or (2)2/4x6/8
-        r'(?:\s*\[.*?\])?'                         # strip [■ WRONG ...] annotation
-        r'\s+(INT|EXT)',                            # INT or EXT
-        re.IGNORECASE
+    logger.info(
+        f"[facts] Extracted {len(deduped)} unique facts "
+        f"(from {len(all_facts)} raw, {llm_errors} LLM errors) "
+        f"for doc_id={doc_id}"
     )
-    seen: set[str] = set()
-    for m in pattern.finditer(text):
-        door_num = m.group(1)
-        if door_num in seen:
-            continue
-        seen.add(door_num)
-        size = _clean(m.group(2))
-        facts.append(_fact(
-            project_id, doc_id, "architectural",
-            f"door_{door_num}_size", size,
-            section="08100",
-            quote=f"Door {door_num}: {size}",
-        ))
-
-    # Attic ladder (special format: ATT 20x54 or ATT 22.2x54)
-    attic = re.search(r'\bATT\s+([\d.]+x[\d]+)\s+INT', text, re.IGNORECASE)
-    if attic:
-        facts.append(_fact(
-            project_id, doc_id, "architectural",
-            "attic_ladder_size", _clean(attic.group(1)),
-            section="08100", quote=f"ATT {attic.group(1)}",
-        ))
-
-    return facts
+    return len(deduped)
 
 
-def _extract_window_schedule(text: str, doc_id: str, project_id: str) -> list[dict]:
+def _deduplicate_facts(facts: list[dict]) -> list[dict]:
     """
-    Section 08500 — Window Schedule.
-    Matches: A  NYL  3/0x5/0  Double Hung  Egress Window
-    Covers defects: W-01 to W-04.
+    Deduplicate facts by (category, field, normalized_value).
+    Keeps the first occurrence (earliest page reference).
     """
-    facts = []
-    # Window label A-K followed by optional material, then size, then operation
-    pattern = re.compile(
-        r'\b([A-K])\s+'
-        r'(?:NYL|EX\.?|VINYL)?\s*'
-        r'((?:\(\d+\))?[\d]+/[\d]+x[\d]+/[\d]+)'   # size
-        r'(?:\s*\[.*?\])?'                            # strip annotations
-        r'\s*(DOUBLE HUNG|CASEMENT|TRANSOM|FIXED|SLIDER|SLIDING)?',
-        re.IGNORECASE
+    seen: set[tuple] = set()
+    unique: list[dict] = []
+    for f in facts:
+        key = (
+            f["category"],
+            _normalise_field(f["field"]),
+            _normalise_value(f["value"]),
+        )
+        if key not in seen:
+            seen.add(key)
+            unique.append(f)
+    return unique
+
+
+def _normalise_field(field: str) -> str:
+    return field.strip().lower().replace(" ", "_").replace("-", "_")
+
+
+def _normalise_value(raw: str) -> str:
+    v = raw.strip().lower()
+    v = re.sub(r"(\d)\s*(mm|cm|m|mpa|n/mm2|kn|kpa|kg)", r"\1 \2", v)
+    return v
+
+
+def _extract_from_chunk(
+    chunk: dict, filename: str, doc_type: str, fields: list[str]
+) -> list[dict] | None:
+    """
+    Call LLM to extract facts from a single chunk.
+    Returns list of facts, or None if LLM call failed.
+    """
+    prompt = _EXTRACT_PROMPT.format(
+        filename = filename,
+        doc_type = doc_type,
+        page     = chunk["page"],
+        text     = chunk["text"][:1200],
+        fields   = ", ".join(fields),
     )
-    seen: set[str] = set()
-    for m in pattern.finditer(text):
-        label = m.group(1).upper()
-        if label in seen:
-            continue
-        seen.add(label)
-        size = _clean(m.group(2))
-        facts.append(_fact(
-            project_id, doc_id, "architectural",
-            f"window_{label}_size", size,
-            section="08500", quote=f"Window {label}: {size}",
-        ))
-        if m.group(3):
-            facts.append(_fact(
-                project_id, doc_id, "architectural",
-                f"window_{label}_operation", m.group(3).strip().title(),
-                section="08500", quote=f"Window {label}: {m.group(3).strip()}",
-            ))
-    return facts
+    try:
+        raw = generate_json(prompt).strip()
+    except ValueError as e:
+        # Bug 6 fix: generate_json now raises on Gemini error strings
+        logger.warning(f"[facts] LLM error for chunk page={chunk['page']}: {e}")
+        return None
 
-
-def _extract_u_factor(text: str, doc_id: str, project_id: str) -> list[dict]:
-    """
-    Section 08500 — U-Factor.
-    Blueprint: MAX. U = .31    Spec (defective): 0.35
-    Covers defect: W-05 (U-factor wrong in spec).
-    """
-    # Matches: MAX. U = .31  or  U-Factor: 0.35  or  U = 0.31
-    m = re.search(
-        r'(?:MAX\.?\s*U\s*=\s*\.?|U[\s-]?FACTOR[:\s]+\.?)(\d*\.?\d+)',
-        text, re.IGNORECASE
-    )
-    if m:
-        return [_fact(
-            project_id, doc_id, "architectural",
-            "window_u_factor", m.group(1),
-            section="08500", quote=m.group(0)[:80],
-        )]
+    try:
+        result = json.loads(raw)
+        if isinstance(result, list):
+            return [f for f in result if f.get("field") and f.get("value")]
+    except json.JSONDecodeError:
+        logger.debug(f"[facts] JSON parse failed: {raw[:80]}")
     return []
 
 
-def _extract_header_schedule(text: str, doc_id: str, project_id: str) -> list[dict]:
-    """
-    Section 06100 — Header Schedule.
-    Blueprint: Openings up to 3'-0"  →  (2) 2x10
-    Spec:      Openings up to 3'-0"  →  (2) 1.75x11.875 1.9E Microlam
-    Covers defects: H-01 (wrong size), H-02 (wrong grade).
-    """
-    facts = []
+def get_facts_for_project(project_id: str, db: Session) -> list[dict]:
+    """Return all facts for a project with document filename included."""
+    facts = db.query(Fact, ProjectDocument.filename).join(
+        ProjectDocument, Fact.document_id == ProjectDocument.id
+    ).filter(Fact.project_id == project_id).all()
 
-    # Opening ≤ 3'-0"
-    m = re.search(
-        r'(?:UP TO|OPENINGS UP TO)\s*3[\'\-]0[\'"]?\s+'
-        r'((?:\(\d+\)\s*)?(?:[\d.]+x[\d.]+|\d+x\d+)(?:\s+[\d.]+E\s+\S+)?)',
-        text, re.IGNORECASE
-    )
-    if m:
-        facts.append(_fact(
-            project_id, doc_id, "structural",
-            "header_opening_up_to_3ft", _clean(m.group(1).strip()),
-            section="06100", quote=m.group(0)[:120],
-        ))
-
-    # Opening > 3' to 6'
-    m = re.search(
-        r'(?:GREATER THAN|>)\s*3[\'\-]0[\'"]?\s+(?:TO|UP TO)\s*6[\'\-]0[\'"]?\s+'
-        r'((?:\(\d+\)\s*)?(?:[\d.]+x[\d.]+)(?:\s+[\d.]+E\s+\S+)?)',
-        text, re.IGNORECASE
-    )
-    if m:
-        facts.append(_fact(
-            project_id, doc_id, "structural",
-            "header_opening_3ft_to_6ft", _clean(m.group(1).strip()),
-            section="06100", quote=m.group(0)[:120],
-        ))
-
-    # Opening > 6' to 8'
-    m = re.search(
-        r'(?:GREATER THAN|>)\s*6[\'\-]0[\'"]?\s+(?:TO|UP TO)\s*8[\'\-]0[\'"]?\s+'
-        r'((?:\(\d+\)\s*)?(?:[\d.]+x[\d.]+)(?:\s+[\d.]+E\s+\S+)?)',
-        text, re.IGNORECASE
-    )
-    if m:
-        facts.append(_fact(
-            project_id, doc_id, "structural",
-            "header_opening_6ft_to_8ft", _clean(m.group(1).strip()),
-            section="06100", quote=m.group(0)[:120],
-        ))
-
-    # LVL grade (1.9E vs 1.5E) — subtle defect H-02
-    for grade_m in re.finditer(r'([\d.]+E)\s+Microlam', text, re.IGNORECASE):
-        facts.append(_fact(
-            project_id, doc_id, "structural",
-            "header_lvl_grade", grade_m.group(1).upper(),
-            section="06100", quote=grade_m.group(0)[:80],
-        ))
-
-    return facts
-
-
-def _extract_room_finishes(text: str, doc_id: str, project_id: str) -> list[dict]:
-    """
-    Section 09300 — Room Finish Schedule (floor materials only).
-    Covers defects: R-01 to R-06.
-    """
-    facts = []
-
-    # Rooms to track → normalised field key
-    ROOMS: dict[str, str] = {
-        r"dining[\s/]?room":       "dining_room",
-        r"bedroom[\s]?2":          "bedroom_2",
-        r"bedroom[\s]?3":          "bedroom_3",
-        r"storage[\s\(\w\)]*":     "storage_basement",
-        r"master[\s]?bath\w*":     "master_bath",
-        r"garage":                 "garage",
-        r"pantry":                 "pantry",
-        r"living[\s]?room":        "living_room",
-        r"kitchen":                "kitchen",
-        r"laundry[\w\s/]*room":    "laundry",
-        r"sunroom":                "sunroom",
-        r"craft[\s]?room":         "craft_room",
-        r"entertainment[\s]?area": "entertainment_area",
-        r"sump[\s]?closet":        "sump_closet",
-        r"bath[\s]?room[\s]?2":    "bathroom_2",
-    }
-
-    FINISH_MATERIALS = (
-        "CERAMIC TILE", "LVT", "CARPET", "CONCRETE",
-        "UNFINISHED", "BEAD BOARD", "PAINTED GYP",
-        "MACADAM", "CONCRETE PAVERS",
-    )
-    mat_pat = re.compile(
-        "|".join(re.escape(m) for m in FINISH_MATERIALS),
-        re.IGNORECASE,
-    )
-
-    for room_regex, room_key in ROOMS.items():
-        m = re.search(
-            rf'\b({room_regex})\b([^\n]{{1,120}})',
-            text, re.IGNORECASE
-        )
-        if not m:
-            continue
-        line = _clean(m.group(2))  # strip [■ WRONG ...] first
-        mat = mat_pat.search(line)
-        if mat:
-            value = mat.group(0).strip().title()
-            facts.append(_fact(
-                project_id, doc_id, "architectural",
-                f"floor_finish_{room_key}", value,
-                section="09300",
-                quote=f"{m.group(1).strip()}: {value}",
-            ))
-
-    return facts
-
-
-# ── Helpers ───────────────────────────────────────────────────────────────────
-
-def _clean(s: str) -> str:
-    """Strip [■ WRONG — ...] spec annotations and extra whitespace."""
-    s = re.sub(r'\[.*?\]', '', s)   # remove [■ WRONG — should be ...]
-    s = re.sub(r'■.*', '', s)       # remove anything after ■
-    return re.sub(r'\s+', ' ', s).strip()
-
-
-def _norm(s: str) -> str:
-    return re.sub(r'\s+', ' ', s.strip().lower())
-
-
-def _fact(
-    project_id: str, doc_id: str, category: str,
-    field: str, value: str,
-    section: str = "", quote: str = "",
-    page: int = 0, sheet: str = "A100",
-) -> dict:
-    return {
-        "project_id":  project_id,
-        "document_id": doc_id,
-        "category":    category,
-        "field":       field,
-        "value":       value,
-        "unit":        "",
-        "page":        page,
-        "sheet":       sheet,
-        "section":     section,
-        "quote":       quote[:100],
-    }
- 
+    return [
+        {
+            "id":          f.Fact.id,
+            "category":    f.Fact.category,
+            "field":       f.Fact.field,
+            "value":       f.Fact.value,
+            "unit":        f.Fact.unit,
+            "page":        f.Fact.page,
+            "sheet":       f.Fact.sheet,
+            "section":     f.Fact.section,
+            "quote":       f.Fact.quote,
+            "document_id": f.Fact.document_id,
+            "filename":    f.filename,
+        }
+        for f in facts
+    ]
