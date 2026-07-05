@@ -23,8 +23,6 @@ AI-powered construction document intelligence — upload blueprints and specific
   - Ubuntu/WSL: `sudo apt install poppler-utils`
   - macOS: `brew install poppler`
   - Windows: download from [oschwartz10612/poppler-windows](https://github.com/oschwartz10612/poppler-windows/releases) and add to PATH
-- A free Gemini API key from [Google AI Studio](https://aistudio.google.com)
-
 ---
 
 ## Setup & Run
@@ -183,7 +181,4 @@ pytest
 ```
 
 Tests use synthetic PDFs with seeded conflicts and run without a real API key. Tests marked `llm` or `slow` require a valid `GEMINI_API_KEY` and are skipped by default.
-
----
-
-*ConstructOS — 2025*
+ 
