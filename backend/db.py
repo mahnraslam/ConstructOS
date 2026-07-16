@@ -42,6 +42,9 @@ class ProjectDocument(Base):
     page_count   = Column(Integer, default=0)
     chunk_count  = Column(Integer, default=0)
     added_at     = Column(DateTime, server_default=func.now())
+    updated_at   = Column(DateTime, server_default=func.now(), onupdate=func.now())
+    status       = Column(String, default="pending")
+    status_detail = Column(String, nullable=True)
     project      = relationship("Project", back_populates="documents")
     facts        = relationship("Fact", back_populates="document", cascade="all, delete-orphan")
 
