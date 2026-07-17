@@ -81,7 +81,63 @@ docker-compose up --build
    - **RFI** — drafted RFI letters generated from detected conflicts
 
 ---
-
+## ERD 
+                                ┌──────────────────────────┐
+                                │         PROJECT          │
+                                ├──────────────────────────┤
+                                │ PK project_id : UUID     │
+                                │ name                     │
+                                │ created_at               │
+                                └─────────────┬────────────┘
+                                              │ 1
+                                              │
+                                              │
+                                              │ *
+                    ┌─────────────────────────▼────────────────────────┐
+                    │              PROJECT_DOCUMENT                     │
+                    ├───────────────────────────────────────────────────┤
+                    │ PK doc_id : UUID                                 │
+                    │ FK project_id                                    │
+                    │ filename                                         │
+                    │ document_type                                    │
+                    │ page_count                                       │
+                    │ chunk_count                                      │
+                    │ status                                           │
+                    │ status_detail                                    │
+                    │ created_at                                       │
+                    │ updated_at                                       │
+                    └──────────────┬────────────────────────────────────┘
+                                   │
+                     ┌─────────────┴─────────────┐
+                     │                           │
+                     │                           │
+                    1│                           │1
+                     │                           │
+                     │                           │
+                    *│                           │*
+        ┌────────────▼────────────┐      ┌───────▼─────────────────┐
+        │         CHUNK           │      │          FACT           │
+        ├─────────────────────────┤      ├─────────────────────────┤
+        │ PK chunk_id             │      │ PK id                  │
+        │ FK document_id          │      │ FK document_id         │
+        │ page                    │      │ FK project_id          │
+        │ chunk_text              │      │ category               │
+        │ embedding_id            │      │ field                  │
+        │ metadata                │      │ value                  │
+        └─────────────────────────┘      │ unit                   │
+                                         │ page                   │
+                                         │ sheet                  │
+                                         │ section                │
+                                         │ quote                  │
+                                         └─────────────┬──────────┘
+                                                       │
+                                                       │
+                                         Used for Conflict Detection
+                                                       │
+                                                       ▼
+                                  ┌──────────────────────────────────┐
+                                  │      FACT COMPARISON ENGINE      │
+                                  └──────────────────────────────────┘
 ## Project Structure
 
 ```

@@ -1,13 +1,32 @@
-import os, uuid, shutil, glob, logging
+"""
+Documents router.
+
+Responsibilities ONLY:
+  - Validate the incoming request
+  - Save the uploaded file to disk
+  - Create/update the database record
+  - Kick off processing (background task or inline call)
+  - Translate results/failures into an HTTP response
+
+All actual ingestion work (parsing, embedding, vector storage, fact
+extraction, status transitions) lives in services/pipeline.py and the
+modules it coordinates. This router does not import pdf_parser, embedder,
+or fact_extractor directly.
+"""
+import os
+import uuid
+import shutil
+import glob
+import logging
 from fastapi import APIRouter, UploadFile, File, Form, HTTPException, Depends, BackgroundTasks
 from sqlalchemy.orm import Session
-from services.pdf_parser import parse
-from services.embedder import embed_and_store
 from services import vector_store
-from services.fact_extractor import extract_facts_for_document
-from services.pipeline import process_document
+from services.pipeline import (
+    process_document, process_document_sync,
+    DocumentParsingError, EmptyDocumentError, EmbeddingError,
+)
 from models.schemas import DocumentMeta, DeleteResponse
-from db import get_db, ProjectDocument, SessionLocal
+from db import get_db, ProjectDocument
 from dotenv import load_dotenv
 
 _ENV_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '.env')
@@ -20,6 +39,7 @@ PAGES_DIR  = os.getenv("PAGES_PATH", "storage/pages")
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
 DOC_TYPES = {"blueprint", "specification", "boq", "method_statement", "submittal", "rfi", "om_manual", "other"}
+
 
 def detect_doc_type(filename: str) -> str:
     name = filename.lower()
@@ -40,7 +60,22 @@ def detect_doc_type(filename: str) -> str:
     return "other"
 
 
-@router.post("/upload", response_model=DocumentMeta)
+def _remove_existing_document(db: Session, project_id: str, filename: str) -> None:
+    """If a document with this filename already exists in the project, tear
+    down its vectors/files/DB row so the re-upload replaces it cleanly."""
+    existing = db.query(ProjectDocument).filter(
+        ProjectDocument.project_id == project_id,
+        ProjectDocument.filename == filename,
+    ).first()
+    if existing:
+        logger.info(f"[documents] Re-upload detected for {filename}, cleaning old doc_id={existing.id}")
+        vector_store.delete_document(existing.id)
+        _cleanup_files(existing.id)
+        db.delete(existing)
+        db.commit()
+
+
+@router.post("/upload")
 async def upload_document(
     background_tasks: BackgroundTasks,
     file:       UploadFile = File(...),
@@ -48,28 +83,22 @@ async def upload_document(
     project_id: str        = Form(default=""),
     db:         Session    = Depends(get_db),
 ):
+    # ── Validate request ───────────────────────────────────────────────────
     if not file.filename.lower().endswith(".pdf"):
         raise HTTPException(400, "Only PDF files supported.")
     resolved_type = doc_type if doc_type in DOC_TYPES else detect_doc_type(file.filename)
     doc_id = str(uuid.uuid4())
-    dest   = os.path.join(UPLOAD_DIR, f"{doc_id}_{file.filename}")
+
+    # ── Save uploaded file ──────────────────────────────────────────────────
+    dest = os.path.join(UPLOAD_DIR, f"{doc_id}_{file.filename}")
     with open(dest, "wb") as f:
         shutil.copyfileobj(file.file, f)
+    logger.info(f"[documents] Saved upload doc_id={doc_id} filename={file.filename}")
 
     if project_id:
-        # Check for existing document with same filename in the same project and remove it
-        existing = db.query(ProjectDocument).filter(
-            ProjectDocument.project_id == project_id,
-            ProjectDocument.filename == file.filename,
-        ).first()
-        if existing:
-            logger.info(f"[documents] Re-upload detected for {file.filename}, cleaning old doc_id={existing.id}")
-            vector_store.delete_document(existing.id)
-            _cleanup_files(existing.id)
-            db.delete(existing)
-            db.commit()
+        # ── Create database record, start background processing ───────────
+        _remove_existing_document(db, project_id, file.filename)
 
-        # Create new document record with pending status
         doc = ProjectDocument(
             id=doc_id,
             project_id=project_id,
@@ -82,7 +111,6 @@ async def upload_document(
         db.add(doc)
         db.commit()
 
-        # Add background task for processing
         background_tasks.add_task(
             process_document,
             doc_id=doc_id,
@@ -92,7 +120,8 @@ async def upload_document(
             project_id=project_id,
         )
 
-        # Return immediate response with minimal info (processing will update the record)
+        # Return immediately; the pipeline updates the record asynchronously
+        # and the client polls GET /{doc_id}/status.
         return DocumentMeta(
             doc_id=doc_id,
             filename=file.filename,
@@ -102,66 +131,37 @@ async def upload_document(
             fact_count=None,
             fact_extraction_error=None,
         )
-    else:
-        # No project_id provided: process synchronously (existing behavior)
-        try:
-            chunks, page_count = parse(dest, doc_id)
-        except Exception as e:
-            os.remove(dest)
-            raise HTTPException(500, f"PDF parsing failed: {e}")
-        if not chunks:
-            raise HTTPException(422, "No readable content found in PDF.")
 
-        # Bug 9 fix: clean up old vectors if re-uploading same file to same project
-        # (Not applicable when no project_id, but we keep the check for safety)
-        if project_id:  # This will be false, so skip
-            existing = db.query(ProjectDocument).filter(
-                ProjectDocument.project_id == project_id,
-                ProjectDocument.filename == file.filename,
-            ).first()
-            if existing:
-                logger.info(f"[documents] Re-upload detected for {file.filename}, cleaning old doc_id={existing.id}")
-                vector_store.delete_document(existing.id)
-                _cleanup_files(existing.id)
-                db.delete(existing)
-                db.commit()
-
-        embed_and_store(chunks, doc_id, file.filename, resolved_type)
-
-        # Track fact extraction result for response (Bug 1 fix)
-        fact_count = None
-        fact_error = None
-
-        # Persist to DB if project_id given (not in this branch)
-        if project_id:  # This will be false, so skip
-            pd = ProjectDocument(
-                id=doc_id, project_id=project_id, filename=file.filename,
-                document_type=resolved_type, page_count=page_count,
-                chunk_count=len(chunks),
-            )
-            db.merge(pd)   # merge = insert-or-update
-            db.commit()
-            # Auto-trigger fact extraction for pipeline activation
-            try:
-                fact_count = extract_facts_for_document(
-                    doc_id=doc_id,
-                    project_id=project_id,
-                    filename=file.filename,
-                    doc_type=resolved_type,
-                    db=db,
-                )
-            except Exception as e:
-                # Bug 1 fix: capture error message instead of silently swallowing
-                fact_error = str(e)
-                logger.error(f"[documents] Fact extraction failed for {doc_id}: {e}")
-
-        return DocumentMeta(
-            doc_id=doc_id, filename=file.filename,
-            page_count=page_count, chunk_count=len(chunks),
+    # ── No project_id: process inline and return full metadata (existing,
+    #    backward-compatible synchronous behavior) ───────────────────────────
+    try:
+        result = process_document_sync(
+            doc_id=doc_id,
+            file_path=dest,
+            filename=file.filename,
             doc_type=resolved_type,
-            fact_count=fact_count,
-            fact_extraction_error=fact_error,
+            project_id="",
+            db=None,
         )
+    except DocumentParsingError as e:
+        os.remove(dest)
+        raise HTTPException(500, f"PDF parsing failed: {e}")
+    except EmptyDocumentError as e:
+        os.remove(dest)
+        raise HTTPException(422, str(e))
+    except EmbeddingError as e:
+        os.remove(dest)
+        raise HTTPException(500, f"Embedding failed: {e}")
+
+    return DocumentMeta(
+        doc_id=doc_id,
+        filename=file.filename,
+        page_count=result["page_count"],
+        chunk_count=result["chunk_count"],
+        doc_type=resolved_type,
+        fact_count=result["fact_count"],
+        fact_extraction_error=result["fact_extraction_error"],
+    )
 
 
 @router.get("/", response_model=list[DocumentMeta])
@@ -172,9 +172,7 @@ def list_documents():
 @router.delete("/{doc_id}", response_model=DeleteResponse)
 def delete_document(doc_id: str, db: Session = Depends(get_db)):
     vector_store.delete_document(doc_id)
-    # Bug 5 fix: clean up uploaded PDF and page images from disk
     _cleanup_files(doc_id)
-    # Remove DB entry if exists
     pd = db.query(ProjectDocument).filter(ProjectDocument.id == doc_id).first()
     if pd:
         db.delete(pd)
@@ -184,16 +182,14 @@ def delete_document(doc_id: str, db: Session = Depends(get_db)):
 
 @router.get("/{doc_id}/status")
 def get_document_status(doc_id: str, db: Session = Depends(get_db)):
-    """
-    Get the processing status of a document.
-    """
+    """Get the processing status of a document."""
     doc = db.query(ProjectDocument).filter(ProjectDocument.id == doc_id).first()
     if not doc:
         raise HTTPException(status_code=404, detail="Document not found")
     return {
         "doc_id": doc.id,
         "status": doc.status,
-        "detail": doc.status_detail
+        "detail": doc.status_detail,
     }
 
 
@@ -207,14 +203,12 @@ def page_url(doc_id: str, page_num: int):
 
 def _cleanup_files(doc_id: str):
     """Remove uploaded PDF and rendered page images for a document."""
-    # Remove uploaded PDF
     for f in glob.glob(os.path.join(UPLOAD_DIR, f"{doc_id}_*")):
         try:
             os.remove(f)
             logger.info(f"[documents] Removed upload: {f}")
         except OSError as e:
             logger.warning(f"[documents] Could not remove {f}: {e}")
-    # Remove page images
     for f in glob.glob(os.path.join(PAGES_DIR, f"{doc_id}_page_*.png")):
         try:
             os.remove(f)
